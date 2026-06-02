@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -119,6 +120,56 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    trend: str
+    restock_quantity: int
+    unit_cost: float
+    total_cost: float
+
+class RestockingRecommendationsResponse(BaseModel):
+    recommendations: List[RestockingRecommendation]
+    total_cost: float
+    budget_remaining: float
+
+class CreateRestockingOrderRequest(BaseModel):
+    budget: float
+    warehouse: Optional[str] = None
+
+# Shared restocking algorithm
+TREND_ORDER = {"increasing": 0, "stable": 1, "decreasing": 2}
+
+def _build_recommendations(budget: float) -> List[RestockingRecommendation]:
+    sorted_forecasts = sorted(
+        demand_forecasts,
+        key=lambda f: (
+            TREND_ORDER.get(f["trend"], 3),
+            -(f["forecasted_demand"] - f["current_demand"])
+        )
+    )
+    results = []
+    remaining = budget
+    for f in sorted_forecasts:
+        gap = f["forecasted_demand"] - f["current_demand"]
+        if gap <= 0:
+            continue
+        unit_cost = f.get("unit_cost", 25.0)
+        qty = min(gap, int(remaining // unit_cost))
+        if qty <= 0:
+            continue
+        cost = round(qty * unit_cost, 2)
+        results.append(RestockingRecommendation(
+            item_sku=f["item_sku"],
+            item_name=f["item_name"],
+            trend=f["trend"],
+            restock_quantity=qty,
+            unit_cost=unit_cost,
+            total_cost=cost
+        ))
+        remaining -= cost
+    return results
 
 # API endpoints
 @app.get("/")
@@ -303,6 +354,54 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=RestockingRecommendationsResponse)
+def get_restocking_recommendations(budget: float):
+    """Get recommended items to restock within the given budget"""
+    recommendations = _build_recommendations(budget)
+    total_cost = round(sum(r.total_cost for r in recommendations), 2)
+    return RestockingRecommendationsResponse(
+        recommendations=recommendations,
+        total_cost=total_cost,
+        budget_remaining=round(budget - total_cost, 2)
+    )
+
+@app.post("/api/restocking/order", response_model=Order)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    """Create a restocking order from budget-based recommendations"""
+    recommendations = _build_recommendations(request.budget)
+    if not recommendations:
+        raise HTTPException(status_code=400, detail="No items can be restocked within the given budget")
+
+    now = datetime.now()
+    order_number = f"RST-{now.year}-{str(len(orders) + 1).zfill(4)}"
+    order_date = now.isoformat(timespec="seconds")
+    expected_delivery = (now + timedelta(days=14)).isoformat(timespec="seconds")
+    total_value = round(sum(r.total_cost for r in recommendations), 2)
+
+    new_order = {
+        "id": str(len(orders) + 1),
+        "order_number": order_number,
+        "customer": "Internal Restocking",
+        "items": [
+            {
+                "sku": r.item_sku,
+                "name": r.item_name,
+                "quantity": r.restock_quantity,
+                "unit_price": r.unit_cost
+            }
+            for r in recommendations
+        ],
+        "status": "Submitted",
+        "order_date": order_date,
+        "expected_delivery": expected_delivery,
+        "total_value": total_value,
+        "warehouse": request.warehouse or "All",
+        "category": "Mixed"
+    }
+
+    orders.append(new_order)
+    return new_order
 
 if __name__ == "__main__":
     import uvicorn
